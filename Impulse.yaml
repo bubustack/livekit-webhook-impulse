@@ -1,0 +1,114 @@
+apiVersion: catalog.bubustack.io/v1alpha1
+kind: ImpulseTemplate
+metadata:
+  name: livekit-webhook
+  annotations:
+    registry.bubustack.io/maturity: experimental
+spec:
+  version: 0.1.0
+  description: An Impulse that listens for LiveKit webhook events and triggers a StoryRun.
+  image: ghcr.io/bubustack/livekit-webhook-impulse:0.1.0
+  supportedModes:
+    - deployment
+  configSchema:
+    type: object
+    properties:
+      eventsAllowlist:
+        type: array
+        description: List of LiveKit events to accept (e.g., participant_joined,
+          room_started, track_published).
+        items:
+          type: string
+        default:
+          - participant_joined
+          - track_published
+          - room_started
+          - room_finished
+          - room_ended
+          - participant_left
+          - track_unpublished
+      selfIdentities:
+        type: array
+        description: Participant identities to ignore (e.g., agent identities).
+        items:
+          type: string
+        default:
+          - bubu-agent
+      path:
+        type: string
+        description: HTTP path to receive webhooks.
+        default: /webhook
+      startEvents:
+        type: array
+        description: Events that launch a StoryRun when no active session exists.
+        items:
+          type: string
+        default:
+          - participant_joined
+          - track_published
+      endEvents:
+        type: array
+        description: Events that terminate the active StoryRun for the room.
+        items:
+          type: string
+        default:
+          - room_finished
+          - room_ended
+          - participant_left
+          - track_unpublished
+      policies:
+        type: array
+        description: Optional routing policies that match LiveKit events to stories.
+        items:
+          type: object
+          properties:
+            name:
+              type: string
+            description:
+              type: string
+            storyName:
+              type: string
+              description: Story to launch when this policy matches. Falls back to Impulse.spec.storyRef when omitted.
+            events:
+              type: array
+              description: Event names to match. Supports `*` or `prefix*` wildcards.
+              items:
+                type: string
+            rooms:
+              type: array
+              description: Room name filters (exact, `*`, or `prefix*`).
+              items:
+                type: string
+            participants:
+              type: array
+              description: Participant identity filters (exact, `*`, or `prefix*`).
+              items:
+                type: string
+            storyInputs:
+              type: object
+              description: Arbitrary JSON forwarded as `policy.inputs` and `policyInputs`.
+            metadata:
+              type: object
+              additionalProperties:
+                type: string
+              description: Lightweight labels surfaced to the Story as `policy.metadata`.
+      includeRawEvent:
+        type: boolean
+        description: Include the full protobuf webhook payload under `event.raw`. Adds ~1.5KB per trigger.
+        default: false
+
+  secretSchema:
+    livekitWebhook:
+      description: LiveKit webhook signing key/secret.
+      expectedKeys:
+        - API_KEY
+        - API_SECRET
+      required: true
+
+  execution:
+    service:
+      ports:
+        - name: http
+          protocol: TCP
+          port: 80
+          targetPort: 8080
