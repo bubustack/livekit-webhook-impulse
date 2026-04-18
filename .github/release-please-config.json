@@ -5,6 +5,12 @@
       "release-type": "go",
       "package-name": "livekit-webhook-impulse",
       "include-component-in-tag": false,
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "Impulse.yaml"
+        }
+      ],
       "changelog-sections": [
         {
           "type": "feat",
