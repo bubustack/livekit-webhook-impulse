@@ -4,7 +4,7 @@ go 1.26.2
 
 require (
 	github.com/bubustack/bubu-sdk-go v0.1.2
-	github.com/livekit/protocol v1.42.0
+	github.com/livekit/protocol v1.45.3
 	github.com/twitchtv/twirp v8.1.3+incompatible
 	google.golang.org/protobuf v1.36.11
 )
@@ -54,7 +54,7 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
 	github.com/gammazero/deque v1.1.0 // indirect
-	github.com/go-jose/go-jose/v3 v3.0.4 // indirect
+	github.com/go-jose/go-jose/v3 v3.0.5 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-openapi/jsonpointer v0.21.0 // indirect
@@ -73,7 +73,7 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.11 // indirect
 	github.com/lithammer/shortuuid/v4 v4.2.0 // indirect
 	github.com/livekit/mageutil v0.0.0-20250511045019-0f1ff63f7731 // indirect
-	github.com/livekit/psrpc v0.7.0 // indirect
+	github.com/livekit/psrpc v0.7.1 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/mitchellh/copystructure v1.2.0 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
