@@ -18,18 +18,23 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
 
+	runsv1alpha1 "github.com/bubustack/bobrapet/api/runs/v1alpha1"
+	runsidentity "github.com/bubustack/bobrapet/pkg/runs/identity"
 	sdk "github.com/bubustack/bubu-sdk-go"
 	sdkengram "github.com/bubustack/bubu-sdk-go/engram"
 	sdkk8s "github.com/bubustack/bubu-sdk-go/k8s"
+	"github.com/bubustack/core/contracts"
 	"github.com/livekit/protocol/auth"
 	livekit "github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/webhook"
 	"github.com/twitchtv/twirp"
 	"google.golang.org/protobuf/encoding/protojson"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	cfgpkg "github.com/bubustack/livekit-webhook-impulse/pkg/config"
 )
@@ -134,69 +139,276 @@ func (i *LiveKitImpulse) isEndEvent(eventType string) bool {
 	return ok
 }
 
-func sessionKeyFromEvent(event *livekit.WebhookEvent) string {
-	if event == nil {
-		return ""
-	}
-	if room := event.GetRoom(); room != nil {
-		if sid := strings.TrimSpace(room.GetSid()); sid != "" {
-			return sid
+type storyRunInputs struct {
+	Room *storyRunRoom `json:"room,omitempty"`
+}
+
+type storyRunRoom struct {
+	Name string `json:"name,omitempty"`
+	Sid  string `json:"sid,omitempty"`
+}
+
+func uniqueNonEmpty(values ...string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
 		}
-		if name := strings.TrimSpace(room.GetName()); name != "" {
-			return name
+		if _, ok := seen[value]; ok {
+			continue
 		}
+		seen[value] = struct{}{}
+		out = append(out, value)
 	}
-	if id := strings.TrimSpace(event.GetId()); id != "" {
-		return id
+	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, raw := range values {
+		if value := strings.TrimSpace(raw); value != "" {
+			return value
+		}
 	}
 	return ""
 }
 
-func (i *LiveKitImpulse) handleRoomEnded(ctx context.Context, sessionKey string) {
+func sessionKeysFromEvent(event *livekit.WebhookEvent) []string {
+	if event == nil {
+		return nil
+	}
+	if room := event.GetRoom(); room != nil {
+		return uniqueNonEmpty(room.GetSid(), room.GetName(), event.GetId())
+	}
+	return uniqueNonEmpty(event.GetId())
+}
+
+func sessionKeyFromEvent(event *livekit.WebhookEvent) string {
+	keys := sessionKeysFromEvent(event)
+	if len(keys) == 0 {
+		return ""
+	}
+	return keys[0]
+}
+
+func triggerTokenFromEvent(event *livekit.WebhookEvent) string {
+	if event == nil {
+		return ""
+	}
+	if room := event.GetRoom(); room != nil {
+		// Use room SID when available so each room lifecycle gets a stable
+		// cluster-side dedupe key even if the room name is reused later.
+		return firstNonEmpty(room.GetSid(), room.GetName(), event.GetId())
+	}
+	return strings.TrimSpace(event.GetId())
+}
+
+func storyRunSessionKeys(run *runsv1alpha1.StoryRun) []string {
+	if run == nil {
+		return nil
+	}
+	keys := make([]string, 0, 3)
+	if token := strings.TrimSpace(run.GetAnnotations()[runsidentity.StoryRunTriggerTokenAnnotation]); token != "" {
+		keys = append(keys, token)
+	}
+	if run.Spec.Inputs == nil || len(run.Spec.Inputs.Raw) == 0 {
+		return uniqueNonEmpty(keys...)
+	}
+	var inputs storyRunInputs
+	if err := json.Unmarshal(run.Spec.Inputs.Raw, &inputs); err != nil || inputs.Room == nil {
+		return uniqueNonEmpty(keys...)
+	}
+	keys = append(keys, inputs.Room.Name, inputs.Room.Sid)
+	return uniqueNonEmpty(keys...)
+}
+
+func resolveImpulseIdentity() (string, string) {
+	return strings.TrimSpace(os.Getenv(contracts.ImpulseNameEnv)),
+		firstNonEmpty(
+			os.Getenv(contracts.ImpulseNamespaceEnv),
+			os.Getenv(contracts.PodNamespaceEnv),
+		)
+}
+
+func matchesAnyKey(candidateKeys []string, keySet map[string]struct{}) bool {
+	for _, key := range candidateKeys {
+		if _, ok := keySet[strings.TrimSpace(key)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (i *LiveKitImpulse) findActiveStoryRuns(
+	ctx context.Context,
+	k8sClient *sdkk8s.Client,
+	impulseName, namespace string,
+	sessionKeys []string,
+) ([]runsv1alpha1.StoryRun, error) {
+	if k8sClient == nil {
+		return nil, fmt.Errorf("k8s client is required")
+	}
+	if impulseName == "" {
+		return nil, fmt.Errorf("impulse name is required")
+	}
+	if namespace == "" {
+		return nil, fmt.Errorf("namespace is required")
+	}
+	if len(sessionKeys) == 0 {
+		return nil, nil
+	}
+
+	keySet := make(map[string]struct{}, len(sessionKeys))
+	for _, key := range sessionKeys {
+		if key = strings.TrimSpace(key); key != "" {
+			keySet[key] = struct{}{}
+		}
+	}
+	if len(keySet) == 0 {
+		return nil, nil
+	}
+
+	var runs runsv1alpha1.StoryRunList
+	if err := k8sClient.List(ctx, &runs, ctrlclient.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("list storyruns: %w", err)
+	}
+
+	matches := make([]runsv1alpha1.StoryRun, 0, len(runs.Items))
+	for _, run := range runs.Items {
+		if run.Status.Phase.IsTerminal() {
+			continue
+		}
+		if run.Spec.ImpulseRef == nil || strings.TrimSpace(run.Spec.ImpulseRef.Name) != impulseName {
+			continue
+		}
+		if run.Spec.ImpulseRef.Namespace != nil && strings.TrimSpace(*run.Spec.ImpulseRef.Namespace) != "" &&
+			strings.TrimSpace(*run.Spec.ImpulseRef.Namespace) != namespace {
+			continue
+		}
+		if matchesAnyKey(storyRunSessionKeys(&run), keySet) {
+			matches = append(matches, run)
+		}
+	}
+	return matches, nil
+}
+
+func (i *LiveKitImpulse) forgetSessionAliases(keys ...string) {
+	if i.dispatcher == nil {
+		return
+	}
+	for _, key := range uniqueNonEmpty(keys...) {
+		i.dispatcher.Forget(key)
+	}
+}
+
+func (i *LiveKitImpulse) handleRoomEnded(
+	ctx context.Context,
+	k8sClient *sdkk8s.Client,
+	sessionKey string,
+	event *livekit.WebhookEvent,
+) {
 	logger := i.loggerWithContext(ctx)
+	sessionKeys := sessionKeysFromEvent(event)
+	if len(sessionKeys) == 0 && sessionKey != "" {
+		sessionKeys = uniqueNonEmpty(sessionKey)
+	}
+	if sessionKey == "" {
+		sessionKey = firstNonEmpty(sessionKeys...)
+	}
 	if sessionKey == "" {
 		logger.Warn("Room end event missing room identifier; skipping StoryRun shutdown")
 		return
 	}
-	if i.dispatcher == nil {
-		logger.Warn("Dispatcher not initialized; cannot stop story", slog.String("room", sessionKey))
+	if i.dispatcher != nil {
+		shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		session, err := i.dispatcher.Stop(shutdownCtx, sessionKey)
+		switch {
+		case err == nil:
+			if session != nil {
+				logger.Info("Ended story for room",
+					slog.String("story", session.StoryName),
+					slog.String("room", sessionKey),
+					slog.String("storyRunNamespace", session.Namespace),
+					slog.String("storyRun", session.StoryRun),
+				)
+			} else {
+				logger.Info("Ended story for room", slog.String("room", sessionKey))
+			}
+			return
+		case errors.Is(err, sdk.ErrStoryRunNotFound):
+			logger.Info("StoryRun already gone; clearing session", slog.String("room", sessionKey))
+			return
+		case !errors.Is(err, sdk.ErrImpulseSessionNotFound):
+			if session != nil {
+				logger.Error("Failed to stop StoryRun",
+					slog.String("namespace", session.Namespace),
+					slog.String("storyRun", session.StoryRun),
+					slog.String("room", sessionKey),
+					slog.Any("error", err),
+				)
+			} else {
+				logger.Error("Failed to stop StoryRun for room",
+					slog.String("room", sessionKey),
+					slog.Any("error", err),
+				)
+			}
+			return
+		}
+	}
+
+	impulseName, impulseNamespace := resolveImpulseIdentity()
+	if impulseName == "" || impulseNamespace == "" {
+		logger.Warn("Cannot resolve impulse identity; skipping Kubernetes fallback stop",
+			slog.String("room", sessionKey),
+			slog.String("impulseName", impulseName),
+			slog.String("impulseNamespace", impulseNamespace),
+		)
+		return
+	}
+	if k8sClient == nil {
+		logger.Warn("Kubernetes client unavailable; skipping fallback stop",
+			slog.String("room", sessionKey),
+			slog.String("impulse", impulseName),
+		)
 		return
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	lookupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	session, err := i.dispatcher.Stop(shutdownCtx, sessionKey)
-	switch {
-	case err == nil:
-		if session != nil {
-			logger.Info("Ended story for room",
-				slog.String("story", session.StoryName),
-				slog.String("room", sessionKey),
-				slog.String("storyRunNamespace", session.Namespace),
-				slog.String("storyRun", session.StoryRun),
-			)
-		} else {
-			logger.Info("Ended story for room", slog.String("room", sessionKey))
-		}
-	case errors.Is(err, sdk.ErrImpulseSessionNotFound):
+	matches, err := i.findActiveStoryRuns(lookupCtx, k8sClient, impulseName, impulseNamespace, sessionKeys)
+	if err != nil {
+		logger.Error("Failed to locate StoryRun for LiveKit end event",
+			slog.String("room", sessionKey),
+			slog.String("impulse", impulseName),
+			slog.Any("error", err),
+		)
+		return
+	}
+	if len(matches) == 0 {
 		logger.Info("No active StoryRun recorded; skipping shutdown", slog.String("room", sessionKey))
-	case errors.Is(err, sdk.ErrStoryRunNotFound):
-		logger.Info("StoryRun already gone; clearing session", slog.String("room", sessionKey))
-	default:
-		if session != nil {
-			logger.Error("Failed to stop StoryRun",
-				slog.String("namespace", session.Namespace),
-				slog.String("storyRun", session.StoryRun),
+		return
+	}
+
+	for _, run := range matches {
+		if err := k8sClient.StopStoryRun(lookupCtx, run.Name, run.Namespace); err != nil {
+			logger.Error("Failed to stop StoryRun from Kubernetes fallback lookup",
 				slog.String("room", sessionKey),
+				slog.String("storyRunNamespace", run.Namespace),
+				slog.String("storyRun", run.Name),
 				slog.Any("error", err),
 			)
-		} else {
-			logger.Error("Failed to stop StoryRun for room",
-				slog.String("room", sessionKey),
-				slog.Any("error", err),
-			)
+			continue
 		}
+		i.forgetSessionAliases(append(sessionKeys, storyRunSessionKeys(&run)...)...)
+		logger.Info("Ended story for room via Kubernetes fallback",
+			slog.String("room", sessionKey),
+			slog.String("storyRunNamespace", run.Namespace),
+			slog.String("storyRun", run.Name),
+		)
 	}
 }
 
@@ -292,7 +504,7 @@ func (i *LiveKitImpulse) Run(ctx context.Context, k8sClient *sdkk8s.Client) erro
 }
 
 // webhookHandler is the core logic for processing a single webhook event.
-func (i *LiveKitImpulse) webhookHandler(_ *sdkk8s.Client) http.HandlerFunc {
+func (i *LiveKitImpulse) webhookHandler(k8sClient *sdkk8s.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		logger := i.loggerWithContext(r.Context())
 		if !validWebhookRequest(w, r) {
@@ -304,7 +516,7 @@ func (i *LiveKitImpulse) webhookHandler(_ *sdkk8s.Client) http.HandlerFunc {
 		}
 		evType := strings.TrimSpace(event.GetEvent())
 		sessionKey := sessionKeyFromEvent(event)
-		if i.handleNonStartingEvent(r.Context(), w, logger, event, evType, sessionKey) {
+		if i.handleNonStartingEvent(r.Context(), k8sClient, w, logger, event, evType, sessionKey) {
 			return
 		}
 
@@ -317,6 +529,7 @@ func (i *LiveKitImpulse) webhookHandler(_ *sdkk8s.Client) http.HandlerFunc {
 			logger,
 			evType,
 			sessionKey,
+			triggerTokenFromEvent(event),
 			roomName,
 			participantIdentity,
 			inputs,
@@ -369,6 +582,7 @@ func (i *LiveKitImpulse) receiveWebhookEvent(
 
 func (i *LiveKitImpulse) handleNonStartingEvent(
 	ctx context.Context,
+	k8sClient *sdkk8s.Client,
 	w http.ResponseWriter,
 	logger *slog.Logger,
 	event *livekit.WebhookEvent,
@@ -384,7 +598,7 @@ func (i *LiveKitImpulse) handleNonStartingEvent(
 			w.WriteHeader(http.StatusAccepted)
 			return true
 		}
-		i.handleRoomEnded(ctx, sessionKey)
+		i.handleRoomEnded(ctx, k8sClient, sessionKey, event)
 		w.WriteHeader(http.StatusAccepted)
 		return true
 	}
@@ -486,7 +700,7 @@ func addStoryInputs(
 func (i *LiveKitImpulse) dispatchMatchingStories(
 	ctx context.Context,
 	logger *slog.Logger,
-	evType, sessionKey, roomName, participantIdentity string,
+	evType, sessionKey, triggerToken, roomName, participantIdentity string,
 	inputs map[string]any,
 	matchingPolicies []cfgpkg.Policy,
 ) error {
@@ -495,7 +709,7 @@ func (i *LiveKitImpulse) dispatchMatchingStories(
 			slog.String("event", evType),
 			slog.String("room", roomName),
 		)
-		if err := i.dispatchStory(ctx, logger, sessionKey, "", inputs, nil); err != nil {
+		if err := i.dispatchStory(ctx, logger, sessionKey, triggerToken, "", inputs, nil); err != nil {
 			logger.Error("Failed to trigger default story",
 				slog.String("event", evType),
 				slog.String("room", roomName),
@@ -514,7 +728,7 @@ func (i *LiveKitImpulse) dispatchMatchingStories(
 			slog.String("room", roomName),
 			slog.String("participant", participantIdentity),
 		)
-		if err := i.dispatchStory(ctx, logger, sessionKey, storyName, inputs, &policy); err != nil {
+		if err := i.dispatchStory(ctx, logger, sessionKey, triggerToken, storyName, inputs, &policy); err != nil {
 			logger.Error("Failed to trigger story for policy",
 				slog.String("story", storyName),
 				slog.String("policy", policy.Name),
@@ -535,7 +749,7 @@ func writeTextResponse(w http.ResponseWriter, status int, body string) {
 func (i *LiveKitImpulse) dispatchStory(
 	ctx context.Context,
 	logger *slog.Logger,
-	sessionKey, storyName string,
+	sessionKey, triggerToken, storyName string,
 	baseInputs map[string]any,
 	policy *cfgpkg.Policy,
 ) error {
@@ -565,9 +779,10 @@ func (i *LiveKitImpulse) dispatchStory(
 	}
 
 	req := sdk.StoryTriggerRequest{
-		Key:       sessionKey,
-		StoryName: storyName,
-		Inputs:    payload,
+		Key:          sessionKey,
+		TriggerToken: triggerToken,
+		StoryName:    storyName,
+		Inputs:       payload,
 	}
 	if policy != nil && policy.Name != "" {
 		req.Metadata = map[string]string{"policy": policy.Name}
