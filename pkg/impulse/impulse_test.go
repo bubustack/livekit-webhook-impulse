@@ -22,6 +22,8 @@ import (
 	cfgpkg "github.com/bubustack/livekit-webhook-impulse/pkg/config"
 )
 
+const testStoryRunNamespace = "livekit-voice"
+
 func TestInitRejectsNilSecrets(t *testing.T) {
 	t.Parallel()
 
@@ -72,7 +74,6 @@ func TestFindActiveStoryRunsMatchesImpulseAndRoomIdentifiers(t *testing.T) {
 		newStoryRun(
 			t,
 			"active-token-match",
-			"livekit-voice",
 			"livekit-webhook",
 			enums.PhaseRunning,
 			map[string]string{runsidentity.StoryRunTriggerTokenAnnotation: "RM_123"},
@@ -81,7 +82,6 @@ func TestFindActiveStoryRunsMatchesImpulseAndRoomIdentifiers(t *testing.T) {
 		newStoryRun(
 			t,
 			"active-room-match",
-			"livekit-voice",
 			"livekit-webhook",
 			enums.PhaseRunning,
 			nil,
@@ -90,7 +90,6 @@ func TestFindActiveStoryRunsMatchesImpulseAndRoomIdentifiers(t *testing.T) {
 		newStoryRun(
 			t,
 			"terminal-ignored",
-			"livekit-voice",
 			"livekit-webhook",
 			enums.PhaseSucceeded,
 			map[string]string{runsidentity.StoryRunTriggerTokenAnnotation: "RM_123"},
@@ -99,7 +98,6 @@ func TestFindActiveStoryRunsMatchesImpulseAndRoomIdentifiers(t *testing.T) {
 		newStoryRun(
 			t,
 			"other-impulse-ignored",
-			"livekit-voice",
 			"another-impulse",
 			enums.PhaseRunning,
 			map[string]string{runsidentity.StoryRunTriggerTokenAnnotation: "RM_123"},
@@ -112,7 +110,7 @@ func TestFindActiveStoryRunsMatchesImpulseAndRoomIdentifiers(t *testing.T) {
 		context.Background(),
 		client,
 		"livekit-webhook",
-		"livekit-voice",
+		testStoryRunNamespace,
 		[]string{"support-demo", "RM_123"},
 	)
 	if err != nil {
@@ -125,12 +123,12 @@ func TestFindActiveStoryRunsMatchesImpulseAndRoomIdentifiers(t *testing.T) {
 
 func TestHandleRoomEndedFallsBackToKubernetesLookupAndClearsAliases(t *testing.T) {
 	const (
-		namespace  = "livekit-voice"
-		impulse    = "livekit-webhook"
-		storyRun   = "voice-run"
-		roomSID    = "RM_123"
-		roomName   = "support-demo"
-		storyName  = "livekit-voice-assistant"
+		namespace = testStoryRunNamespace
+		impulse   = "livekit-webhook"
+		storyRun  = "voice-run"
+		roomSID   = "RM_123"
+		roomName  = "support-demo"
+		storyName = "livekit-voice-assistant"
 	)
 	t.Setenv(contracts.ImpulseNameEnv, impulse)
 	t.Setenv(contracts.ImpulseNamespaceEnv, namespace)
@@ -138,7 +136,6 @@ func TestHandleRoomEndedFallsBackToKubernetesLookupAndClearsAliases(t *testing.T
 	run := newStoryRun(
 		t,
 		storyRun,
-		namespace,
 		impulse,
 		enums.PhaseRunning,
 		nil,
@@ -185,7 +182,11 @@ func TestHandleRoomEndedFallsBackToKubernetesLookupAndClearsAliases(t *testing.T
 	imp.handleRoomEnded(context.Background(), client, sessionKeyFromEvent(event), event)
 
 	updated := &runsv1alpha1.StoryRun{}
-	if err := client.Get(context.Background(), ctrlclient.ObjectKey{Name: storyRun, Namespace: namespace}, updated); err != nil {
+	if err := client.Get(
+		context.Background(),
+		ctrlclient.ObjectKey{Name: storyRun, Namespace: namespace},
+		updated,
+	); err != nil {
 		t.Fatalf("get updated StoryRun: %v", err)
 	}
 	if updated.Spec.CancelRequested == nil || !*updated.Spec.CancelRequested {
@@ -210,7 +211,7 @@ func newTestK8sClient(t *testing.T, objects ...ctrlclient.Object) *sdkk8s.Client
 
 func newStoryRun(
 	t *testing.T,
-	name, namespace, impulseName string,
+	name, impulseName string,
 	phase enums.Phase,
 	annotations map[string]string,
 	inputs map[string]any,
@@ -225,7 +226,7 @@ func newStoryRun(
 	return &runsv1alpha1.StoryRun{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
-			Namespace:   namespace,
+			Namespace:   testStoryRunNamespace,
 			Annotations: annotations,
 		},
 		Spec: runsv1alpha1.StoryRunSpec{
