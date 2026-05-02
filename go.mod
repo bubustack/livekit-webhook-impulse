@@ -6,7 +6,7 @@ require (
 	github.com/bubustack/bobrapet v0.1.13
 	github.com/bubustack/bubu-sdk-go v0.1.5
 	github.com/bubustack/core v0.1.6
-	github.com/livekit/protocol v1.45.3
+	github.com/livekit/protocol v1.45.6
 	github.com/twitchtv/twirp v8.1.3+incompatible
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
 	k8s.io/apimachinery v0.36.0
